@@ -329,6 +329,7 @@ private slots:
     void evdevPressQueuedBeforeItsPosition();
     void evdevFirstPressWithoutAMoveSinceStart();
     void evdevFirstPressTrustsTheIntegrationDevice();
+    void evdevFirstMoveFarFromTheCorner();
     void evdevReleaseQueuedBeforeTheLastMove();
     void evdevDragQueuedAllAtOnce();
     void evdevMovesLeftAfterAPressStillCount();
@@ -585,6 +586,27 @@ void tst_VboxTouch::evdevFirstPressTrustsTheIntegrationDevice()
     COMPARE_POINT(touch(0).pos, expected(8192, 24576, IntegrationMax));
     mouse.button(false);
     QVERIFY(waitForTouches(2));
+}
+
+void tst_VboxTouch::evdevFirstMoveFarFromTheCorner()
+{
+    // The mouse integration device spans 0..65535; measured from where the
+    // device starts out, the top left corner, the bottom right of the
+    // screen is further than an int holds squared.
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    FakeDevice integration(path("integration"), Kind::Integration);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + integration.path());
+
+    integration.absMove(40960, 40960);
+    settle();
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    COMPARE_POINT(touch(0).pos, expected(40960, 40960, IntegrationMax));
+    integration.absMove(40960, 36864);
+    QVERIFY(waitForTouches(2));
+    COMPARE_POINT(touch(1).pos, expected(40960, 36864, IntegrationMax));
+    mouse.button(false);
+    QVERIFY(waitForTouches(3));
 }
 
 void tst_VboxTouch::evdevReleaseQueuedBeforeTheLastMove()

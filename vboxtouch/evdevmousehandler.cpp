@@ -374,8 +374,11 @@ void EvdevMouseHandler::processQueue(qint64 limit)
     }
     m_queue.remove(0, qsizetype(i) * qsizetype(sizeof(struct ::input_event)));
     if (m_compression && pendingMouseEvent) {
-        int distanceSquared = (m_x - m_prevx)*(m_x - m_prevx) + (m_y - m_prevy)*(m_y - m_prevy);
-        if (distanceSquared > m_jitterLimitSquared)
+        // In 64 bits: across the 0..65535 of VirtualBox's mouse integration
+        // device the square overflows an int, went negative and dropped every
+        // move until the pointer came back near where the last one was sent.
+        const qint64 dx = qint64(m_x) - m_prevx, dy = qint64(m_y) - m_prevy;
+        if (dx * dx + dy * dy > m_jitterLimitSquared)
             sendMouseEvent();
     }
 }

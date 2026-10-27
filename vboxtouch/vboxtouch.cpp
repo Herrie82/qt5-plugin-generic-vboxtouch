@@ -29,7 +29,12 @@
 #include <QGuiApplication>
 #include <QSocketNotifier>
 #include <QStringList>
+#include <QKeyEvent>
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QPointingDevice>
+#else
 #include <QTouchDevice>
+#endif
 #include <QtQuick/QQuickWindow>
 
 #include <qpa/qwindowsysteminterface.h>
@@ -115,8 +120,14 @@ const static vbox_set_mouse_status set_mouse_status = {
     0x10001, // request version
     0, // type: default
     -1, // rc: pre-emptive error code
-    sizeof(vbox_header), 0, { VBOXMOUSE_WANT_ABSOLUTE | VBOXMOUSE_NEW_PROTOCOL | VBOXMOUSE_HOST_DRAWS_CURSOR }
+    sizeof(vbox_header), 0, { { VBOXMOUSE_WANT_ABSOLUTE | VBOXMOUSE_NEW_PROTOCOL | VBOXMOUSE_HOST_DRAWS_CURSOR } }
 };
+
+// Qt 6 moved the touch point states to QEventPoint, keeping their values.
+static const VboxTouchPointState TouchPointPressed = VboxTouchPointState(Qt::TouchPointPressed);
+static const VboxTouchPointState TouchPointMoved = VboxTouchPointState(Qt::TouchPointMoved);
+static const VboxTouchPointState TouchPointStationary = VboxTouchPointState(Qt::TouchPointStationary);
+static const VboxTouchPointState TouchPointReleased = VboxTouchPointState(Qt::TouchPointReleased);
 
 QRect screenGeometryFromFramebuffer()
 {
@@ -182,7 +193,7 @@ QPointF devicePointToScreenPoint(const QPointF &p, const QRect &screen)
                    normal_y * (screen.height() - 1) + screen.y());
 }
 
-QWindowSystemInterface::TouchPoint createTouchPoint(const QPointF &p, Qt::TouchPointState state, bool pressed, const QRect &screen)
+QWindowSystemInterface::TouchPoint createTouchPoint(const QPointF &p, VboxTouchPointState state, bool pressed, const QRect &screen)
 {
     const qreal normal_x = p.x() / VBOX_COORD_MAX;
     const qreal normal_y = p.y() / VBOX_COORD_MAX;
@@ -260,7 +271,8 @@ VirtualboxTouchScreenHandler::VirtualboxTouchScreenHandler(const QString &specif
     }
 
     m_notifier = new QSocketNotifier(m_fd, QSocketNotifier::Read, this);
-    connect(m_notifier, SIGNAL(activated(int)), this, SLOT(handleInput()));
+    connect(m_notifier, &QSocketNotifier::activated,
+            this, &VirtualboxTouchScreenHandler::handleInput);
 
     QString evdev_device = QString::fromLocal8Bit(qgetenv("VIRTUALBOX_TOUCH_EVDEV_MOUSE"));
     Q_FOREACH (QString option, specification.split(':')) {
@@ -288,11 +300,20 @@ VirtualboxTouchScreenHandler::VirtualboxTouchScreenHandler(const QString &specif
     connect(m_mouse, &EvdevMouseHandler::handleMouseEvent,
             this, &VirtualboxTouchScreenHandler::handleEvdevInput);
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    // Two points: the zoom gesture reports a pair of fingers.
+    m_device = new QPointingDevice(QFileInfo(device_name).fileName(), 1,
+                                   QInputDevice::DeviceType::TouchScreen,
+                                   QPointingDevice::PointerType::Finger,
+                                   QInputDevice::Capability::Position, 2, 0);
+    QWindowSystemInterface::registerInputDevice(m_device);
+#else
     m_device = new QTouchDevice;
     m_device->setName(QFileInfo(device_name).fileName());
     m_device->setType(QTouchDevice::TouchScreen);
     m_device->setCapabilities(QTouchDevice::Position);
     QWindowSystemInterface::registerTouchDevice(m_device);
+#endif
 }
 
 VirtualboxTouchScreenHandler::~VirtualboxTouchScreenHandler()
@@ -406,7 +427,7 @@ void VirtualboxTouchScreenHandler::handleInput()
     m_x = request.x;
     m_y = request.y;
     if (m_button) {
-        reportTouch(moved ? Qt::TouchPointMoved : Qt::TouchPointStationary);
+        reportTouch(moved ? TouchPointMoved : TouchPointStationary);
     }
 
     if (m_indicator->isActive())
@@ -426,11 +447,11 @@ void VirtualboxTouchScreenHandler::handleEvdevInput(int x, int y, bool abs, Qt::
     bool leftButton = (buttons & Qt::LeftButton) != 0;
     if (leftButton != m_button) {
         m_button = leftButton;
-        reportTouch(m_button ? Qt::TouchPointPressed : Qt::TouchPointReleased);
+        reportTouch(m_button ? TouchPointPressed : TouchPointReleased);
     }
 }
 
-void VirtualboxTouchScreenHandler::reportTouch(Qt::TouchPointState state)
+void VirtualboxTouchScreenHandler::reportTouch(VboxTouchPointState state)
 {
     QList<QWindowSystemInterface::TouchPoint> touchpoints;
 
@@ -444,7 +465,7 @@ void VirtualboxTouchScreenHandler::reportTouch(Qt::TouchPointState state)
         touchpoints << createTouchPoint(QPointF(m_x, m_y), state, m_button, m_screenGeometry);
     }
 
-    QWindowSystemInterface::handleTouchEvent(0, m_device, touchpoints);
+    QWindowSystemInterface::handleTouchEvent(nullptr, m_device, touchpoints);
 }
 
 bool VirtualboxTouchScreenHandler::eventFilter(QObject *obj, QEvent *event)

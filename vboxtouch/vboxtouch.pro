@@ -1,8 +1,12 @@
 TARGET = vboxtouchplugin
 
-PLUGIN_TYPE = generic
-PLUGIN_CLASS_NAME = VirtualboxTouchScreenPlugin
-load(qt_plugin)
+TEMPLATE = lib
+CONFIG += plugin
+
+# Not load(qt_plugin): that is for plugins built inside Qt, and the Qt 6
+# installers no longer ship it.
+target.path = $$[QT_INSTALL_PLUGINS]/generic
+INSTALLS += target
 
 SOURCES = \
     main.cpp \

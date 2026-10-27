@@ -30,8 +30,18 @@
 #include <QRect>
 #include <QEvent>
 
-class QSocketNotifier;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QEventPoint>
+class QPointingDevice;
+typedef QPointingDevice VboxTouchDevice;
+typedef QEventPoint::State VboxTouchPointState;
+#else
 class QTouchDevice;
+typedef QTouchDevice VboxTouchDevice;
+typedef Qt::TouchPointState VboxTouchPointState;
+#endif
+
+class QSocketNotifier;
 
 class EvdevMouseHandler;
 class ZoomIndicator;
@@ -56,7 +66,7 @@ protected:
 private:
     int m_fd;
     QSocketNotifier *m_notifier;
-    QTouchDevice *m_device;
+    VboxTouchDevice *m_device;
     EvdevMouseHandler *m_mouse;
     int m_failures;
 
@@ -70,7 +80,7 @@ private:
     bool m_button;
     int m_x;
     int m_y;
-    void reportTouch(Qt::TouchPointState state);
+    void reportTouch(VboxTouchPointState state);
 
     void setUpSignalHandlers();
     static void quitSignalHandler(int sig);

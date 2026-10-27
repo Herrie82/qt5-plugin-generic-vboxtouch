@@ -537,8 +537,16 @@ void VirtualboxTouchScreenHandler::handleEvdevInput(int x, int y, bool abs, Qt::
         m_y = y;
     }
 
-    // Only the left button counts as a touch
-    bool leftButton = (buttons & Qt::LeftButton) != 0;
+    // Only the left button counts as a touch, held on any of the devices:
+    // with the guest additions running, VirtualBox reports the position on
+    // its mouse integration device and the buttons on the PS/2 mouse, and a
+    // move on the one says nothing about the button held on the other.
+    m_miceButtons[sender()] = buttons;
+    Qt::MouseButtons held = Qt::NoButton;
+    for (QHash<QObject *, Qt::MouseButtons>::const_iterator it = m_miceButtons.constBegin();
+         it != m_miceButtons.constEnd(); ++it)
+        held |= it.value();
+    bool leftButton = (held & Qt::LeftButton) != 0;
     if (leftButton != m_button) {
         m_button = leftButton;
         reportTouch(m_button ? TouchPointPressed : TouchPointReleased);

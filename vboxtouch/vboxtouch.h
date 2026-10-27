@@ -29,6 +29,7 @@
 #include <QString>
 #include <QRect>
 #include <QEvent>
+#include <QHash>
 #include <QList>
 #include <QStringList>
 
@@ -75,6 +76,8 @@ private:
     QSocketNotifier *m_notifier;
     VboxTouchDevice *m_device;
     QList<EvdevMouseHandler *> m_mice;
+    // The buttons each of m_mice holds down: each reports only its own.
+    QHash<QObject *, Qt::MouseButtons> m_miceButtons;
     int m_failures;
 
     QRect m_screenGeometry; // x,y - ui offset relative to framebuffer; size - framebuffer size

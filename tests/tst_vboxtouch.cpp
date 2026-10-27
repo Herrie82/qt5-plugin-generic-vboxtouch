@@ -274,6 +274,7 @@ private slots:
     void evdevTabletPressMoveRelease();
     void evdevFirstPressIsWhereThePointerIs();
     void evdevRelativeMouseOnlyAddsButtons();
+    void evdevDragWithTheButtonOnAnotherDevice();
     void evdevSkipsDevicesThatDoNotOpen();
     void evdevDevicesFromEnvironment();
     void evdevWithoutDevicesDoesNothing();
@@ -417,6 +418,37 @@ void tst_VboxTouch::evdevRelativeMouseOnlyAddsButtons()
     QVERIFY(waitForTouches(2));
     QCOMPARE(touch(1).type, QEvent::TouchEnd);
     COMPARE_POINT(touch(1).pos, expected(8192, 8192, TabletMax));
+}
+
+void tst_VboxTouch::evdevDragWithTheButtonOnAnotherDevice()
+{
+    // With the guest additions running, VirtualBox reports the position on
+    // its mouse integration device and the buttons on the PS/2 mouse. A move
+    // on the one must not end the touch the other holds.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + tablet.path() + ":evdev=" + mouse.path());
+
+    tablet.absMove(24576, 16384);
+    settle();
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+
+    tablet.absMove(16384, 16384);
+    QVERIFY(waitForTouches(2));
+    QCOMPARE(touch(1).type, QEvent::TouchUpdate);
+    COMPARE_POINT(touch(1).pos, expected(16384, 16384, TabletMax));
+
+    tablet.absMove(8192, 16384);
+    QVERIFY(waitForTouches(3));
+    QCOMPARE(touch(2).type, QEvent::TouchUpdate);
+    COMPARE_POINT(touch(2).pos, expected(8192, 16384, TabletMax));
+
+    mouse.button(false);
+    QVERIFY(waitForTouches(4));
+    QCOMPARE(touch(3).type, QEvent::TouchEnd);
+    COMPARE_POINT(touch(3).pos, expected(8192, 16384, TabletMax));
 }
 
 void tst_VboxTouch::evdevSkipsDevicesThatDoNotOpen()

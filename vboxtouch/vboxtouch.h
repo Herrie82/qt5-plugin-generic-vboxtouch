@@ -29,6 +29,8 @@
 #include <QString>
 #include <QRect>
 #include <QEvent>
+#include <QList>
+#include <QStringList>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QEventPoint>
@@ -51,7 +53,7 @@ class VirtualboxTouchScreenHandler : public QObject
     Q_OBJECT
 
 public:
-    explicit VirtualboxTouchScreenHandler(const QString &specification, QObject *parent = 0);
+    explicit VirtualboxTouchScreenHandler(const QString &specification, QObject *parent = nullptr);
     ~VirtualboxTouchScreenHandler();
 
 private slots:
@@ -64,10 +66,15 @@ protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
 
 private:
+    // Where the position comes from: vboxguest's integrated pointer, or an
+    // absolute evdev device (VirtualBox's USB tablet or its touch screen).
+    enum Mode { VboxGuestMode, EvdevMode };
+    Mode m_mode;
+
     int m_fd;
     QSocketNotifier *m_notifier;
     VboxTouchDevice *m_device;
-    EvdevMouseHandler *m_mouse;
+    QList<EvdevMouseHandler *> m_mice;
     int m_failures;
 
     QRect m_screenGeometry; // x,y - ui offset relative to framebuffer; size - framebuffer size
@@ -81,6 +88,11 @@ private:
     int m_x;
     int m_y;
     void reportTouch(VboxTouchPointState state);
+
+    void initVboxGuest(const QStringList &options, const QString &specification);
+    void initEvdev(const QStringList &options, const QString &specification);
+    void registerTouchDevice(const QString &name);
+    QRect screenGeometry() const;
 
     void setUpSignalHandlers();
     static void quitSignalHandler(int sig);

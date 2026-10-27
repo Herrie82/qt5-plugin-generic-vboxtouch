@@ -17,3 +17,16 @@ For example `-plugin VboxTouch:vboxguest=/dev/vboxguest:evdev=/dev/input/mouse0`
 The mouse inputs are converted to touchscreen events by reporting only
 left button actions (as touches), and reporting movement only when the left
 button is down.
+
+## evdev mode
+
+With `mode=evdev` in the specification the driver does not use vboxguest at
+all. It reads one or more evdev devices instead, taking positions from those
+that report absolute coordinates (VirtualBox's USB tablet or USB multi-touch
+device) and buttons from all of them. The devices are given as `/dev/...` or
+`evdev=...` entries in the specification, or as a colon-separated list in
+`VIRTUALBOX_TOUCH_EVDEV_MOUSE`. Devices that cannot be opened are skipped.
+
+For example `-plugin VboxTouch:mode=evdev:/dev/input/event3:/dev/input/event4`
+
+The zoom gesture (hold Ctrl) works in both modes.

@@ -18,4 +18,4 @@ HEADERS = \
 
 OTHER_FILES += vboxtouch.json
 
-QT += core gui-private quick
+QT += core core-private gui-private quick

@@ -285,7 +285,8 @@ VirtualboxTouchScreenHandler::VirtualboxTouchScreenHandler(const QString &specif
         shutdown();
         return;
     }
-    connect(m_mouse, SIGNAL(handleMouseEvent(int,int,Qt::MouseButtons)), this, SLOT(handleEvdevInput(int,int,Qt::MouseButtons)));
+    connect(m_mouse, &EvdevMouseHandler::handleMouseEvent,
+            this, &VirtualboxTouchScreenHandler::handleEvdevInput);
 
     m_device = new QTouchDevice;
     m_device->setName(QFileInfo(device_name).fileName());
@@ -412,14 +413,19 @@ void VirtualboxTouchScreenHandler::handleInput()
         m_indicator->moveTo(devicePointToScreenPoint(QPointF(m_x, m_y), m_screenGeometry));
 }
 
-void VirtualboxTouchScreenHandler::handleEvdevInput(int x, int y, Qt::MouseButtons buttons)
+void VirtualboxTouchScreenHandler::handleEvdevInput(int x, int y, bool abs, Qt::MouseButtons buttons,
+                                                    Qt::MouseButton button, QEvent::Type type)
 {
+    // The position comes from vboxguest; the mouse only adds its buttons.
     Q_UNUSED(x);
     Q_UNUSED(y);
+    Q_UNUSED(abs);
+    Q_UNUSED(button);
+    Q_UNUSED(type);
     // Only the left button counts as a touch
-    bool button = (buttons & Qt::LeftButton) != 0;
-    if (button != m_button) {
-        m_button = button;
+    bool leftButton = (buttons & Qt::LeftButton) != 0;
+    if (leftButton != m_button) {
+        m_button = leftButton;
         reportTouch(m_button ? Qt::TouchPointPressed : Qt::TouchPointReleased);
     }
 }

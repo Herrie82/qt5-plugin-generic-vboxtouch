@@ -28,6 +28,7 @@
 #include <QObject>
 #include <QString>
 #include <QRect>
+#include <QEvent>
 
 class QSocketNotifier;
 class QTouchDevice;
@@ -46,7 +47,8 @@ public:
 private slots:
     void handleInput(); // connected to m_notifier
     void shutdown();
-    void handleEvdevInput(int x, int y, Qt::MouseButtons buttons);
+    void handleEvdevInput(int x, int y, bool abs, Qt::MouseButtons buttons,
+                          Qt::MouseButton button, QEvent::Type type);
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;

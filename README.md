@@ -30,3 +30,11 @@ device) and buttons from all of them. The devices are given as `/dev/...` or
 For example `-plugin VboxTouch:mode=evdev:/dev/input/event3:/dev/input/event4`
 
 The zoom gesture (hold Ctrl) works in both modes.
+
+## Tests
+
+`tests/` has unit tests for the handler. They compile the plugin's sources
+in, fake the devices with FIFOs and run on the offscreen platform, so they
+need neither VirtualBox nor a display:
+
+    cd tests && qmake && make check

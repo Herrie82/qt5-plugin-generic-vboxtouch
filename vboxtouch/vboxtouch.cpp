@@ -30,6 +30,7 @@
 #include <QSocketNotifier>
 #include <QStringList>
 #include <QKeyEvent>
+#include <QScreen>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QPointingDevice>
 #else
@@ -131,7 +132,12 @@ static const VboxTouchPointState TouchPointReleased = VboxTouchPointState(Qt::To
 
 QRect screenGeometryFromFramebuffer()
 {
-    const QSize uiSize(QGuiApplication::primaryScreen()->size());
+    const QScreen *primaryScreen = QGuiApplication::primaryScreen();
+    if (primaryScreen == nullptr) {
+        qWarning("vboxtouch: no screen to map touches to");
+        return QRect();
+    }
+    const QSize uiSize(primaryScreen->size());
     QRect defaultGeometry(QPoint(), uiSize);
 
     /* Read framebuffer dimentions from device
@@ -224,10 +230,11 @@ VirtualboxTouchScreenHandler::VirtualboxTouchScreenHandler(const QString &specif
 
     qApp->installEventFilter(this);
 
-    connect(qApp, &QGuiApplication::focusWindowChanged, [this](QWindow *w) {
-        if (w == nullptr) return;
+    connect(qApp, &QGuiApplication::focusWindowChanged, this, [this](QWindow *w) {
+        // The indicator is a Quick item; any other kind of window cannot hold it.
+        auto quickWindow = qobject_cast<QQuickWindow *>(w);
+        if (quickWindow == nullptr) return;
 
-        auto quickWindow = static_cast<QQuickWindow *>(w);
         m_indicator->setParentItem(quickWindow->contentItem());
         m_indicator->setPosition(quickWindow->position());
         m_indicator->setWidth(quickWindow->width());

@@ -29,7 +29,19 @@ device) and buttons from all of them. The devices are given as `/dev/...` or
 
 For example `-plugin VboxTouch:mode=evdev:/dev/input/event3:/dev/input/event4`
 
-The zoom gesture (hold Ctrl) works in both modes.
+With the guest additions' mainline `vboxguest` driver loaded, VirtualBox
+reports the pointer on the "VirtualBox mouse integration" device and the
+clicks on the PS/2 mouse, so list both (and the USB tablet, for when the
+additions are not running). A click is matched with the position the
+integration device reported before it, whichever device is read first.
+
+Without a `mode=` entry the driver starts in vboxguest mode and falls back to
+evdev mode when `/dev/vboxguest` cannot be used.
+
+The zoom gesture (hold Ctrl) works in both modes, and the mouse wheel scrolls
+whatever is under the pointer.
+
+Set `QT_LOGGING_RULES=vboxtouch.debug=true` to log every input and touch.
 
 ## Tests
 

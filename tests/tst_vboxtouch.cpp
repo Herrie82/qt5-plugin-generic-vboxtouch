@@ -28,13 +28,16 @@
 // other fd goes to the kernel.
 
 #include "vboxtouch.h"
+#include "evdevmousehandler.h"
 
 #include <QtTest>
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QScreen>
 #include <QTemporaryDir>
+#include <QKeyEvent>
 #include <QTouchEvent>
+#include <QWheelEvent>
 #include <QWindow>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -63,14 +66,20 @@
 
 namespace {
 
-enum class Kind { AbsTablet, RelMouse, VboxGuest };
+enum class Kind { AbsTablet, Integration, RelMouse, VboxGuest };
 
 std::mutex g_lock;
 std::map<std::string, Kind> g_devices;
 int g_guestX = 0;
 int g_guestY = 0;
+long g_clock = 0; // microseconds: every event written is later than the one before
+int g_tabletX = 0; // where the kernel last saw the fake tablet
+int g_tabletY = 0;
+int g_integrationX = 0; // and the fake mouse integration device
+int g_integrationY = 0;
 
 const int TabletMax = 32767; // VirtualBox's USB tablet
+const int IntegrationMax = 65535; // and its mouse integration device
 
 bool kindOf(int fd, Kind *kind)
 {
@@ -126,17 +135,29 @@ int fakeIoctl(Kind kind, unsigned long request, void *arg)
         return 0;
     if (nr == _IOC_NR(EVIOCGBIT(EV_ABS, 0))) {
         memset(arg, 0, _IOC_SIZE(request));
-        if (kind == Kind::AbsTablet) {
+        if (kind == Kind::AbsTablet || kind == Kind::Integration) {
             unsigned char *bits = static_cast<unsigned char *>(arg);
             bits[ABS_X / 8] |= 1 << (ABS_X % 8);
             bits[ABS_Y / 8] |= 1 << (ABS_Y % 8);
         }
         return 0;
     }
-    if (kind == Kind::AbsTablet && (request == EVIOCGABS(ABS_X) || request == EVIOCGABS(ABS_Y))) {
+    if (kind == Kind::Integration && _IOC_NR(request) == _IOC_NR(EVIOCGNAME(0))) {
+        static const char name[] = "VirtualBox mouse integration";
+        const size_t length = qMin(sizeof(name), size_t(_IOC_SIZE(request)));
+        memcpy(arg, name, length);
+        return int(length);
+    }
+    if ((kind == Kind::AbsTablet || kind == Kind::Integration)
+        && (request == EVIOCGABS(ABS_X) || request == EVIOCGABS(ABS_Y))) {
         input_absinfo *info = static_cast<input_absinfo *>(arg);
         memset(info, 0, sizeof(*info));
-        info->maximum = TabletMax;
+        info->maximum = kind == Kind::Integration ? IntegrationMax : TabletMax;
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (kind == Kind::Integration)
+            info->value = request == EVIOCGABS(ABS_X) ? g_integrationX : g_integrationY;
+        else
+            info->value = request == EVIOCGABS(ABS_X) ? g_tabletX : g_tabletY;
         return 0;
     }
     errno = ENOTTY;
@@ -163,12 +184,19 @@ namespace {
 struct Touch {
     QEvent::Type type;
     QPointF pos;
+    QList<int> ids; // of all the points
+};
+
+struct Wheel {
+    QPoint angleDelta;
+    QPointF pos;
 };
 
 class TouchWindow : public QWindow
 {
 public:
     QList<Touch> touches;
+    QList<Wheel> wheels;
 
 protected:
     bool event(QEvent *e) override
@@ -176,12 +204,27 @@ protected:
         if (e->type() == QEvent::TouchBegin || e->type() == QEvent::TouchUpdate
             || e->type() == QEvent::TouchEnd) {
             const QTouchEvent *te = static_cast<QTouchEvent *>(e);
+            QList<int> ids;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+            for (const QEventPoint &p : te->points())
+                ids << p.id();
             if (!te->points().isEmpty())
-                touches << Touch{ e->type(), te->points().first().globalPosition() };
+                touches << Touch{ e->type(), te->points().first().globalPosition(), ids };
 #else
+            for (const QTouchEvent::TouchPoint &p : te->touchPoints())
+                ids << p.id();
             if (!te->touchPoints().isEmpty())
-                touches << Touch{ e->type(), te->touchPoints().first().screenPos() };
+                touches << Touch{ e->type(), te->touchPoints().first().screenPos(), ids };
+#endif
+            e->accept();
+            return true;
+        }
+        if (e->type() == QEvent::Wheel) {
+            const QWheelEvent *we = static_cast<QWheelEvent *>(e);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+            wheels << Wheel{ we->angleDelta(), we->globalPosition() };
+#else
+            wheels << Wheel{ we->angleDelta(), we->globalPosF() };
 #endif
             e->accept();
             return true;
@@ -216,6 +259,13 @@ public:
             return;
         input_event ev;
         memset(&ev, 0, sizeof(ev));
+        {
+            // The kernel stamps each event; reading in order relies on it.
+            std::lock_guard<std::mutex> lock(g_lock);
+            ++g_clock;
+            ev.input_event_sec = g_clock / 1000000;
+            ev.input_event_usec = g_clock % 1000000;
+        }
         ev.type = type;
         ev.code = code;
         ev.value = value;
@@ -224,6 +274,7 @@ public:
     void sync() { event(EV_SYN, SYN_REPORT, 0); }
     void absMove(int x, int y) { event(EV_ABS, ABS_X, x); event(EV_ABS, ABS_Y, y); sync(); }
     void button(bool down) { event(EV_KEY, BTN_LEFT, down ? 1 : 0); sync(); }
+    void wheel(int clicks) { event(EV_REL, REL_WHEEL, clicks); sync(); }
 
     void guestPosition(int x, int y)
     {
@@ -275,11 +326,23 @@ private slots:
     void evdevFirstPressIsWhereThePointerIs();
     void evdevRelativeMouseOnlyAddsButtons();
     void evdevDragWithTheButtonOnAnotherDevice();
+    void evdevPressQueuedBeforeItsPosition();
+    void evdevFirstPressWithoutAMoveSinceStart();
+    void evdevFirstPressTrustsTheIntegrationDevice();
+    void evdevReleaseQueuedBeforeTheLastMove();
+    void evdevDragQueuedAllAtOnce();
+    void evdevMovesLeftAfterAPressStillCount();
+    void readerHandlesWhatItReadPastTheLimit();
+    void evdevWheelAtThePointer();
+    void evdevWheelBeforeAnyPositionIsDropped();
+    void evdevPinchHasTwoFingers();
+    void devicesWithoutModeFallBackToEvdev();
     void evdevSkipsDevicesThatDoNotOpen();
     void evdevDevicesFromEnvironment();
     void evdevWithoutDevicesDoesNothing();
     void focusOnAWindowThatIsNotQuick();
     void vboxGuestPositionWithEvdevButtons();
+    void vboxGuestWheelAtThePointer();
     void vboxGuestThatDoesNotOpen();
 
 private:
@@ -317,6 +380,11 @@ void tst_VboxTouch::init()
     QVERIFY(m_dir->isValid());
     qunsetenv("VIRTUALBOX_TOUCH_EVDEV_MOUSE");
     qunsetenv("VIRTUALBOX_TOUCH_GUEST_DEVICE");
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_tabletX = g_tabletY = 0;
+        g_integrationX = g_integrationY = 0;
+    }
 
     m_window.reset(new TouchWindow);
     // Frameless: offscreen windows otherwise get a frame, and touches on the
@@ -451,6 +519,243 @@ void tst_VboxTouch::evdevDragWithTheButtonOnAnotherDevice()
     COMPARE_POINT(touch(3).pos, expected(8192, 16384, TabletMax));
 }
 
+void tst_VboxTouch::evdevPressQueuedBeforeItsPosition()
+{
+    // The click and the position it was made at arrive on two devices, and
+    // the click's is often read first. The mouse is opened first here, so
+    // that its notifier fires first when both have input.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + tablet.path());
+
+    tablet.absMove(8192, 8192);
+    settle();
+    tablet.absMove(24576, 16384);
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    COMPARE_POINT(touch(0).pos, expected(24576, 16384, TabletMax));
+
+    mouse.button(false);
+    QVERIFY(waitForTouches(2));
+    QCOMPARE(touch(1).type, QEvent::TouchEnd);
+    COMPARE_POINT(touch(1).pos, expected(24576, 16384, TabletMax));
+}
+
+void tst_VboxTouch::evdevFirstPressWithoutAMoveSinceStart()
+{
+    // The compositor (re)started under a pointer that has not moved since:
+    // only the kernel knows where it is.
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_tabletX = 8192;
+        g_tabletY = 24576;
+    }
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + tablet.path() + ":evdev=" + mouse.path());
+
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    COMPARE_POINT(touch(0).pos, expected(8192, 24576, TabletMax));
+    mouse.button(false);
+    QVERIFY(waitForTouches(2));
+}
+
+void tst_VboxTouch::evdevFirstPressTrustsTheIntegrationDevice()
+{
+    // The USB tablet still has the position it had before the guest
+    // additions took over; it comes first in the specification, as on LuneOS.
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_tabletX = 30000;
+        g_tabletY = 15000;
+        g_integrationX = 8192;
+        g_integrationY = 24576;
+    }
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice integration(path("integration"), Kind::Integration);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + tablet.path()
+                                         + ":evdev=" + integration.path());
+
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    COMPARE_POINT(touch(0).pos, expected(8192, 24576, IntegrationMax));
+    mouse.button(false);
+    QVERIFY(waitForTouches(2));
+}
+
+void tst_VboxTouch::evdevReleaseQueuedBeforeTheLastMove()
+{
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + tablet.path());
+
+    tablet.absMove(8192, 8192);
+    settle();
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+
+    // The drag's last stretch and the release, read in the wrong order.
+    tablet.absMove(24576, 16384);
+    mouse.button(false);
+    QVERIFY(waitForTouches(3));
+    QCOMPARE(touch(1).type, QEvent::TouchUpdate);
+    COMPARE_POINT(touch(1).pos, expected(24576, 16384, TabletMax));
+    QCOMPARE(touch(2).type, QEvent::TouchEnd);
+    COMPARE_POINT(touch(2).pos, expected(24576, 16384, TabletMax));
+}
+
+void tst_VboxTouch::evdevDragQueuedAllAtOnce()
+{
+    // A whole drag (a scripted one, or a fast flick) queued before any of it
+    // is read: the moves made after the press must still be moves of the touch.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + tablet.path());
+
+    tablet.absMove(8192, 8192);
+    settle();
+    mouse.button(true);
+    tablet.absMove(16384, 8192);
+    tablet.absMove(24576, 8192);
+    mouse.button(false);
+    QVERIFY(waitForTouches(3));
+    settle();
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    COMPARE_POINT(touch(0).pos, expected(8192, 8192, TabletMax));
+    QCOMPARE(touch(1).type, QEvent::TouchUpdate);
+    COMPARE_POINT(touch(1).pos, expected(24576, 8192, TabletMax)); // the two moves are one read
+    QCOMPARE(touch(2).type, QEvent::TouchEnd);
+    COMPARE_POINT(touch(2).pos, expected(24576, 8192, TabletMax));
+    QCOMPARE(touchCount(), 3);
+}
+
+void tst_VboxTouch::evdevMovesLeftAfterAPressStillCount()
+{
+    // Taking in what came before the press reads what came after it too;
+    // that must be handled even if nothing more arrives on its device.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path() + ":evdev=" + tablet.path());
+
+    tablet.absMove(8192, 8192);
+    settle();
+    mouse.button(true);
+    tablet.absMove(16384, 16384);
+    QVERIFY(waitForTouches(2));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    COMPARE_POINT(touch(0).pos, expected(8192, 8192, TabletMax));
+    QCOMPARE(touch(1).type, QEvent::TouchUpdate);
+    COMPARE_POINT(touch(1).pos, expected(16384, 16384, TabletMax));
+
+    mouse.button(false);
+    QVERIFY(waitForTouches(3));
+}
+
+void tst_VboxTouch::readerHandlesWhatItReadPastTheLimit()
+{
+    // Reading up to a time reads what came after it from the device as
+    // well, and the device's notifier will not fire for that again.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    QScopedPointer<EvdevMouseHandler> reader(EvdevMouseHandler::create(tablet.path(), QStringLiteral("abs")));
+    QVERIFY(reader);
+    QSignalSpy moves(reader.data(), &EvdevMouseHandler::handleMouseEvent);
+
+    tablet.absMove(8192, 8192);
+    qint64 limit;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        limit = g_clock;
+    }
+    tablet.absMove(16384, 16384);
+
+    reader->readMouseDataUntil(limit);
+    QCOMPARE(moves.size(), 1);
+    QCOMPARE(moves.at(0).at(0).toInt(), qRound(8192.0 * EvdevMouseHandler::AbsRange / TabletMax));
+    QTRY_COMPARE(moves.size(), 2);
+    QCOMPARE(moves.at(1).at(0).toInt(), qRound(16384.0 * EvdevMouseHandler::AbsRange / TabletMax));
+}
+
+void tst_VboxTouch::evdevWheelAtThePointer()
+{
+    // The wheel is on the PS/2 mouse; the pointer on the integration device.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + tablet.path() + ":evdev=" + mouse.path());
+
+    tablet.absMove(16384, 24576);
+    settle();
+    mouse.wheel(-1);
+    QElapsedTimer timer;
+    timer.start();
+    while (m_window->wheels.isEmpty() && timer.elapsed() < 2000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    QCOMPARE(m_window->wheels.size(), 1);
+    QCOMPARE(m_window->wheels.first().angleDelta, QPoint(0, -120));
+    COMPARE_POINT(m_window->wheels.first().pos, expected(16384, 24576, TabletMax));
+    QVERIFY(m_window->touches.isEmpty());
+}
+
+void tst_VboxTouch::evdevWheelBeforeAnyPositionIsDropped()
+{
+    // Without a position the wheel would scroll whatever is in the corner.
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + mouse.path());
+
+    mouse.wheel(1);
+    settle();
+    QVERIFY(m_window->wheels.isEmpty());
+}
+
+void tst_VboxTouch::evdevPinchHasTwoFingers()
+{
+    // Holding Ctrl makes a press a pinch of two fingers around the pointer.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("mode=evdev:evdev=" + tablet.path() + ":evdev=" + mouse.path());
+
+    tablet.absMove(16384, 16384);
+    settle();
+    QKeyEvent ctrlDown(QEvent::KeyPress, Qt::Key_Control, Qt::ControlModifier);
+    QCoreApplication::sendEvent(m_window.data(), &ctrlDown);
+
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    QCOMPARE(touch(0).ids.size(), 2);
+    QVERIFY(touch(0).ids.at(0) != touch(0).ids.at(1));
+
+    mouse.button(false);
+    QVERIFY(waitForTouches(2));
+    QCOMPARE(touch(1).type, QEvent::TouchEnd);
+
+    QKeyEvent ctrlUp(QEvent::KeyRelease, Qt::Key_Control, Qt::NoModifier);
+    QCoreApplication::sendEvent(m_window.data(), &ctrlUp);
+}
+
+void tst_VboxTouch::devicesWithoutModeFallBackToEvdev()
+{
+    // LuneOS passes its devices without a mode, and its kernel's guest
+    // additions have no vboxguest interface the plugin can use.
+    FakeDevice tablet(path("tablet"), Kind::AbsTablet);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    qputenv("VIRTUALBOX_TOUCH_GUEST_DEVICE", path("missing").toLocal8Bit());
+    VirtualboxTouchScreenHandler handler("evdev=" + tablet.path() + ":evdev=" + mouse.path());
+
+    tablet.absMove(8192, 24576);
+    settle();
+    mouse.button(true);
+    QVERIFY(waitForTouches(1));
+    QCOMPARE(touch(0).type, QEvent::TouchBegin);
+    COMPARE_POINT(touch(0).pos, expected(8192, 24576, TabletMax));
+    mouse.button(false);
+    QVERIFY(waitForTouches(2));
+    QCOMPARE(touch(1).type, QEvent::TouchEnd);
+}
+
 void tst_VboxTouch::evdevSkipsDevicesThatDoNotOpen()
 {
     FakeDevice tablet(path("tablet"), Kind::AbsTablet);
@@ -523,6 +828,24 @@ void tst_VboxTouch::vboxGuestPositionWithEvdevButtons()
     mouse.button(false);
     QVERIFY(waitForTouches(3));
     QCOMPARE(touch(2).type, QEvent::TouchEnd);
+}
+
+void tst_VboxTouch::vboxGuestWheelAtThePointer()
+{
+    FakeDevice guest(path("vboxguest"), Kind::VboxGuest);
+    FakeDevice mouse(path("mouse"), Kind::RelMouse);
+    VirtualboxTouchScreenHandler handler("vboxguest=" + guest.path() + ":evdev=" + mouse.path());
+
+    guest.guestPosition(49152, 16384);
+    settle();
+    mouse.wheel(2);
+    QElapsedTimer timer;
+    timer.start();
+    while (m_window->wheels.isEmpty() && timer.elapsed() < 2000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    QCOMPARE(m_window->wheels.size(), 1);
+    QCOMPARE(m_window->wheels.first().angleDelta, QPoint(0, 240));
+    COMPARE_POINT(m_window->wheels.first().pos, expected(49152, 16384, 65535));
 }
 
 void tst_VboxTouch::vboxGuestThatDoesNotOpen()

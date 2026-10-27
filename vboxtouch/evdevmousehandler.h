@@ -51,6 +51,7 @@
 // We mean it.
 //
 
+#include <QByteArray>
 #include <QObject>
 #include <QString>
 #include <QPoint>
@@ -70,6 +71,16 @@ public:
     ~EvdevMouseHandler();
 
     void readMouseData();
+    // Takes in the queued events no later than limit (microseconds, the
+    // kernel's timestamps), leaving the rest for the next event loop pass.
+    void readMouseDataUntil(qint64 limit);
+    // When the event behind the last handleMouseEvent happened.
+    qint64 lastEventTime() const { return m_frameTime; }
+    const QString &device() const { return m_device; }
+    const QString &name() const { return m_name; } // as the kernel names the device
+    // Where an absolute device is now, as the kernel last heard from it,
+    // scaled like handleMouseEvent's; false if the device is not absolute.
+    bool currentPosition(int *x, int *y) const;
 
 signals:
     void handleMouseEvent(int x, int y, bool abs, Qt::MouseButtons buttons,
@@ -80,9 +91,14 @@ private:
     EvdevMouseHandler(const QString &device, int fd, bool abs, bool compression, int jitterLimit);
 
     void sendMouseEvent();
+    void readAvailable();
+    void processQueue(qint64 limit);
+    int scaled(int value, int min, int range) const;
     bool getHardwareMaximum();
 
     QString m_device;
+    QString m_name;
+    QByteArray m_queue; // input_events read but not handled yet
     int m_fd;
     QSocketNotifier *m_notify;
     int m_x, m_y;
@@ -98,6 +114,7 @@ private:
     int m_hardwareMinY;
     int m_hardwareWidth;
     int m_hardwareHeight;
+    qint64 m_frameTime;
 };
 
 #endif // QEVDEVMOUSEHANDLER_P_H

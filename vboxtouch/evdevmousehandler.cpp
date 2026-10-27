@@ -48,6 +48,8 @@
 #include <private/qcore_unix_p.h> // overrides QT_OPEN
 
 #include <errno.h>
+#include <string.h>
+#include <limits>
 
 #ifdef Q_OS_FREEBSD
 #include <dev/evdev/input.h>
@@ -96,9 +98,15 @@ EvdevMouseHandler::EvdevMouseHandler(const QString &device, int fd, bool abs, bo
     : m_device(device), m_fd(fd), m_notify(0), m_x(0), m_y(0), m_prevx(0), m_prevy(0),
       m_abs(abs), m_compression(compression), m_buttons(Qt::NoButton), m_button(Qt::NoButton),
       m_eventType(QEvent::MouseMove), m_jitterLimitSquared(jitterLimit * jitterLimit), m_prevInvalid(true),
-      m_hardwareMinX(0), m_hardwareMinY(0), m_hardwareWidth(0), m_hardwareHeight(0)
+      m_hardwareMinX(0), m_hardwareMinY(0), m_hardwareWidth(0), m_hardwareHeight(0),
+      m_frameTime(0)
 {
     setObjectName(QLatin1String("Evdev Mouse Handler"));
+
+    char kernelName[256];
+    const int length = ioctl(m_fd, EVIOCGNAME(sizeof(kernelName)), kernelName);
+    if (length > 0)
+        m_name = QString::fromLocal8Bit(kernelName, int(qstrnlen(kernelName, size_t(length))));
 
     // Some touch screens present as mice with absolute coordinates.
     // These can not be differentiated from touchpads, so supplying abs to QT_QPA_EVDEV_MOUSE_PARAMETERS
@@ -158,6 +166,25 @@ bool EvdevMouseHandler::getHardwareMaximum()
     return true;
 }
 
+int EvdevMouseHandler::scaled(int value, int min, int range) const
+{
+    return qBound(0, qRound(static_cast<qreal>(value - min) * AbsRange / range), int(AbsRange));
+}
+
+bool EvdevMouseHandler::currentPosition(int *x, int *y) const
+{
+    if (!m_abs || m_fd < 0)
+        return false;
+
+    struct input_absinfo absX, absY;
+    if (ioctl(m_fd, EVIOCGABS(ABS_X), &absX) == -1 || ioctl(m_fd, EVIOCGABS(ABS_Y), &absY) == -1)
+        return false;
+
+    *x = scaled(absX.value, m_hardwareMinX, m_hardwareWidth);
+    *y = scaled(absY.value, m_hardwareMinY, m_hardwareHeight);
+    return true;
+}
+
 void EvdevMouseHandler::sendMouseEvent()
 {
     int x;
@@ -182,8 +209,8 @@ void EvdevMouseHandler::sendMouseEvent()
         // plugin is loaded while the compositor is still coming up, and a scale
         // taken from the screen it saw then was not always right for the one it
         // ended up with (every touch at twice its position, on some boots).
-        x = qBound(0, qRound(static_cast<qreal>(m_x - m_hardwareMinX) * AbsRange / m_hardwareWidth), int(AbsRange));
-        y = qBound(0, qRound(static_cast<qreal>(m_y - m_hardwareMinY) * AbsRange / m_hardwareHeight), int(AbsRange));
+        x = scaled(m_x, m_hardwareMinX, m_hardwareWidth);
+        y = scaled(m_y, m_hardwareMinY, m_hardwareHeight);
     }
 
     emit handleMouseEvent(x, y, m_abs, m_buttons, m_button, m_eventType);
@@ -194,18 +221,41 @@ void EvdevMouseHandler::sendMouseEvent()
 
 void EvdevMouseHandler::readMouseData()
 {
+    readAvailable();
+    processQueue(std::numeric_limits<qint64>::max());
+}
+
+void EvdevMouseHandler::readMouseDataUntil(qint64 limit)
+{
+    readAvailable();
+    processQueue(limit);
+    // What came later is handled once the event that asked for this is.
+    if (!m_queue.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this] {
+            processQueue(std::numeric_limits<qint64>::max());
+        }, Qt::QueuedConnection);
+    }
+}
+
+void EvdevMouseHandler::readAvailable()
+{
+    if (m_fd < 0)
+        return;
+
     struct ::input_event buffer[32];
     int n = 0;
-    bool posChanged = false, btnChanged = false;
-    bool pendingMouseEvent = false;
     forever {
-        int result = QT_READ(m_fd, reinterpret_cast<char *>(buffer) + n, sizeof(buffer) - n);
+        int result = QT_READ(m_fd, reinterpret_cast<char *>(buffer) + n, qint64(sizeof(buffer)) - n);
 
         if (result == 0) {
             qWarning("evdevmouse: Got EOF from the input device");
             return;
         } else if (result < 0) {
-            if (errno != EINTR && errno != EAGAIN) {
+            // Nothing (more) to read: this is also called to take in what a
+            // device has queued, which may be nothing at all.
+            if (errno == EAGAIN)
+                break;
+            if (errno != EINTR) {
                 qErrnoWarning(errno, "evdevmouse: Could not read from input device");
                 // If the device got disconnected, stop reading, otherwise we get flooded
                 // by the above error over and over again.
@@ -224,10 +274,26 @@ void EvdevMouseHandler::readMouseData()
         }
     }
 
-    n /= sizeof(buffer[0]);
+    m_queue.append(reinterpret_cast<const char *>(buffer), n - n % int(sizeof(buffer[0])));
+}
 
-    for (int i = 0; i < n; ++i) {
-        struct ::input_event *data = &buffer[i];
+void EvdevMouseHandler::processQueue(qint64 limit)
+{
+    bool posChanged = false, btnChanged = false;
+    bool pendingMouseEvent = false;
+    const int n = int(m_queue.size() / sizeof(struct ::input_event));
+    int i = 0;
+    bool frameStart = true;
+    for (; i < n; ++i) {
+        // Copied out: the queue's bytes need not be aligned for input_event.
+        struct ::input_event event;
+        memcpy(&event, m_queue.constData() + i * sizeof(event), sizeof(event));
+        const struct ::input_event *data = &event;
+        const qint64 time = qint64(data->input_event_sec) * 1000000 + qint64(data->input_event_usec);
+        if (frameStart && time > limit)
+            break;
+        frameStart = data->type == EV_SYN && data->code == SYN_REPORT;
+        m_frameTime = time;
         if (data->type == EV_ABS) {
             // Touchpads: store the absolute position for now, will calculate a relative one later.
             if (data->code == ABS_X && m_x != data->value) {
@@ -306,6 +372,7 @@ void EvdevMouseHandler::readMouseData()
             continue;
         }
     }
+    m_queue.remove(0, qsizetype(i) * qsizetype(sizeof(struct ::input_event)));
     if (m_compression && pendingMouseEvent) {
         int distanceSquared = (m_x - m_prevx)*(m_x - m_prevx) + (m_y - m_prevy)*(m_y - m_prevy);
         if (distanceSquared > m_jitterLimitSquared)

@@ -26,6 +26,7 @@
 #define VBOXTOUCH_H
 
 #include <QObject>
+#include <QPoint>
 #include <QString>
 #include <QRect>
 #include <QEvent>
@@ -62,6 +63,7 @@ private slots:
     void shutdown();
     void handleEvdevInput(int x, int y, bool abs, Qt::MouseButtons buttons,
                           Qt::MouseButton button, QEvent::Type type);
+    void handleEvdevWheel(QPoint delta);
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -90,6 +92,8 @@ private:
     bool m_button;
     int m_x;
     int m_y;
+    bool m_positionKnown; // m_x, m_y came from a device, not from the constructor
+    bool m_draining; // taking in what the other devices queued
     void reportTouch(VboxTouchPointState state);
 
     void initVboxGuest(const QStringList &options, const QString &specification);

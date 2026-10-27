@@ -26,3 +26,10 @@ HEADERS = \
 
 # The fake devices are FIFOs, made in the build directory.
 DEFINES += TEST_TMPDIR=\\\"$$OUT_PWD\\\"
+
+# Qt takes touch and wheel positions in native pixels: run everything again
+# with the screen scaled, where logical and native pixels differ.
+hidpicheck.commands = QT_SCALE_FACTOR=2 ./$(QMAKE_TARGET)
+hidpicheck.depends = $(QMAKE_TARGET)
+QMAKE_EXTRA_TARGETS += hidpicheck
+check.depends += hidpicheck
